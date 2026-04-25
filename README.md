@@ -1,0 +1,1 @@
+This is a program meant for hardware hacking and firmware patching, it's meant to help by carving and uncompressing parts of a firmware dump, letting you browse around the files and modify them, and in the end compress and combine the raw files back into a flashable firmware file with your modifications applied
