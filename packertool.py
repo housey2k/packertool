@@ -268,6 +268,7 @@ def repack():
         if data[1] == "data": # data type, can be data, squashfs, jffs2, etc
             write_sector(data[2], config["out_file"], int(data[0], 16)) # data[2] is file location, data[0] is offset
             print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
+            
         elif data[1] == "squashfs":
             squashfs_location = os.path.join(config["repack_fs"], f"{section}.squashfs")
             
@@ -281,6 +282,9 @@ def repack():
             
             write_sector(squashfs_location, config["out_file"], int(data[0], 16))
             print(f"Wrote {section} from {squashfs_location} starting at {data[0]} to {config["out_file"]}")
+            
+        else:
+            print(f"Unknown type {data[1]}, ignoring")
     
     
     
@@ -340,6 +344,13 @@ def clean():
 # ----------------- Example -----------------
 if __name__ == "__main__":
     
+    print("packertool v0.0.2")
+    print("Written with <3 by housey2k")
+    print("Version 1.0.1")
+    print("Know your firmware!")
+    print("This program is in early development, please help by contributing with more functionality")
+    
+    
     if len(sys.argv) < 2:
         print("No argument")
         displayArgs()
@@ -360,9 +371,12 @@ if __name__ == "__main__":
     elif sys.argv[1] == "dumpcfg":
         arg = sys.argv[2] if len(sys.argv) > 2 else None
         dumpcfg(arg)
+        
     elif sys.argv[1] == "makecfg":
         makecfg()
+        
     elif sys.argv[1] == "clean":
         clean()
+        
     else:
         print(f"Unknown command: {sys.argv[1]}")
