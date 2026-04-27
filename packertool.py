@@ -4,6 +4,7 @@ import os
 import subprocess
 import magic
 import shutil
+import struct
 
 from pprint import pprint
 
@@ -127,11 +128,111 @@ def get_squashfs_repack_flags(path):
 
     return " ".join(flags)
     
+def get_uimage_repack_flags(path):
+    with open(path, "rb") as f:
+        data = f.read(64)
+
+    if len(data) < 64:
+        raise ValueError("Not a valid uImage (too small)")
+
+    magic, hcrc, time, size, load, entry, dcrc, os, arch, img_type, comp = struct.unpack(
+        ">IIIIIIIBBBB",
+        data[:32]
+    )
+
+    name = data[32:64].split(b"\x00", 1)[0].decode(errors="ignore")
+
+    # sanity check
+    if magic != 0x27051956:
+        raise ValueError("Not a uImage")
+
+    arch_map = {
+        8: "mips",
+        2: "arm",
+        3: "x86",
+    }
+
+    os_map = {
+        5: "linux",
+    }
+
+    comp_map = {
+        2: "gzip",
+        3: "bzip2",
+        4: "lzma",
+        5: "lz4",
+    }
+
+    type_map = {
+        2: "kernel",
+        3: "ramdisk",
+        7: "firmware",
+    }
+
+    arch_str = arch_map.get(arch, "unknown")
+    os_str = os_map.get(os, "linux")
+    comp_str = comp_map.get(comp, "none")
+    type_str = type_map.get(img_type, "firmware")
+
+    # build CLI flags (same style as your squashfs function)
+    flags = []
+
+    flags.append(f"-A {arch_str}")
+    flags.append(f"-O {os_str}")
+    flags.append(f"-T {type_str}")
+    flags.append(f"-C {comp_str}")
+    flags.append(f"-a 0x{load:x}")
+    flags.append(f"-e 0x{entry:x}")
+
+    if name:
+        flags.append(f"-n \"{name}\"")
+
+    return " ".join(flags)
+    
+    
+def extract_uimage(path, out_path):
+    import struct, lzma, gzip
+
+    data = open(path, "rb").read()
+
+    magic = struct.unpack(">I", data[0:4])[0]
+    if magic != 0x27051956:
+        raise ValueError("Not uImage")
+
+    size = struct.unpack(">I", data[12:16])[0]
+    comp = data[40]  # compression field in header
+
+    payload = data[64:64+size]
+
+    # YOU handle payload here
+    if comp == 4:  # LZMA
+        payload = lzma.decompress(payload)
+    elif comp == 2:  # gzip
+        payload = gzip.decompress(payload)
+
+    with open(out_path, "wb") as f:
+        f.write(payload)
+
+    return payload
+    
 def write_sector(in_file, out_file, offset):
     with open(in_file, "rb") as f_in, open(out_file, "r+b") as f_out:
         data = f_in.read()
         f_out.seek(offset)
         f_out.write(data)
+       
+def writeFile(out_file, text, header = ""):
+    file_exists = os.path.exists(out_file)    
+    with open(out_file, "a") as f:
+        if not file_exists:
+            f.write(header)
+            print(f"Created {out_file} and wrote {header}")
+        f.write(text)
+        print(f"Wrote {text} to {out_file}")  
+def runCmd(args, check=True):
+    print(f"Running command {args}")
+    subprocess.run(args, check=check)
+    print(f"Finished command")
     
 def displayArgs():
     print("help           Show help")
@@ -183,16 +284,26 @@ def unpack():
             
             print(f"File recognized as {fileMagic}")
             
-            # TODO: Generate repack.cfg containing each partition's type (squashfs, jffs2, etc), block size, flags, etc
+            # DONE: Generate repack.cfg containing each partition's type (squashfs, jffs2, etc), block size, flags, etc
             # example below
             # # DO NOT EDIT
             # FSBL: data, unpack_raw/FSBL.bin
             # hsqs_part: squashfs, compression_alg, blocksize, unpack_fs/hsqs_part
             # jffs2_part: jffs2, idk how this works, what should i put here, i'll focus no squashfs first, unpack_fs/jffs2_part
+            # ^ done, format ended up pretty different 
             
             #extractedFilePath = os.path.join(config["unpack_fs"], name)
             
             # TODO: jffs2 support
+            
+            # WIP: uImage support
+            
+            
+            # DONE: Change repack.cfg format from "name: offset, type, flags, location" on squashfs and "name: offset, path, type" on raw to "name:offset, type, location, flags"
+            # ^ now its standardized
+            
+            # TODO: Move file operations into /tmp to spare HDD/SSD cycles
+            
             if "Squashfs filesystem" in fileMagic:
                 
                 squashfsFilePath = os.path.join(config["unpack_raw"], f"{name}.squashfs") # raw squashfs file
@@ -203,43 +314,55 @@ def unpack():
                 os.rename(binFilePath, squashfsFilePath) # rename from .bin into .squashfs
                 
                 print(f"Extracting squashfs partition into {squashfsFolder}")
-                subprocess.run(
-                    ["unsquashfs", "-d", squashfsFolder, squashfsFilePath],
-                    check=True
-                )
                 
+                runCmd(["unsquashfs", "-d", squashfsFolder, squashfsFilePath], True)
                 
-                flags = get_squashfs_repack_flags(squashfsFilePath) # flags being compression alg -comp and block size -b
+                squashfs_flags = get_squashfs_repack_flags(squashfsFilePath) # flags being compression alg -comp and block size -b
 
-                print(f"SquashFS flags: {flags}")
-
-                
-                file_exists = os.path.exists("repack.cfg")
-                with open("repack.cfg", "a") as f:
-                    if not file_exists:
-                        print("Created packertool.cfg")
-                        f.write("# DO NOT EDIT\n")
-                    print(f"Wrote \"{name}: {hex(start)}, squashfs, {flags}, {squashfsFolder}\" to repack.cfg")
-                    f.write(f"{name}: {hex(start)}, squashfs, {flags}, {squashfsFolder}\n")
+                print(f"SquashFS flags: {squashfs_flags}")
                     
+                writeFile("repack.cfg", f"{name}: {hex(start)}, squashfs, {squashfsFolder}, {squashfs_flags}\n", "# DO NOT EDIT\n")
+                
                 print(f"Deleting {squashfsFilePath}")
                 os.remove(squashfsFilePath)
+                
+            elif "jffs2 filesystem" in fileMagic:
+                print("jffs2 is not supported, it will be treated as data")
+
+                jffs2FilePath = os.path.join(config["unpack_raw"], f"{name}.jffs2") # raw jffs2 file
+                
+                print(f"Renaming {binFilePath} into {jffs2FilePath}")
+                
+                writeFile("repack.cfg", f"{name}: {hex(start)}, jffs2, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
+                
+            elif "u-boot legacy uImage" in fileMagic:
+                print("u-boot legacy uImage WIP")
+                
+                uImgFilePath = os.path.join(config["unpack_raw"], f"{name}.uimg") # raw jffs2 file
+                extImgPath = os.path.join(config["unpack_raw"], f"{name}.bin") # extracted uImage file
+                
+                print(f"Renaming {binFilePath} into {uImgFilePath}")
+                
+                os.rename(binFilePath, uImgFilePath)
+                
+                print(f"Extracting uImage into {extImgPath}")
+               
+                extract_uimage(uImgFilePath, extImgPath)
+                
+                uImg_flags = get_uimage_repack_flags(uImgFilePath)
+
+                print(f"uImage flags: {uImg_flags}")
+
+                writeFile("repack.cfg", f"{name}: {hex(start)}, uimg, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
+                
+                print(f"Deleting {uImgFilePath}")
+                os.remove(uImgFilePath)
+                
             else:
-                file_exists = os.path.exists("repack.cfg")
-                with open("repack.cfg", "a") as f:
-                    if not file_exists:
-                        print("Created packertool.cfg")
-                        f.write("# DO NOT EDIT\n")
-                    print(f"Wrote \"{name}: {hex(start)}, data, {binFilePath}\" to repack.cfg")
-                    f.write(f"{name}: {hex(start)}, data, {binFilePath}\n")
-            file_exists = os.path.exists("repack.cfg")
+                writeFile("repack.cfg", f"{name}: {hex(start)}, data, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
+        
         filesize = os.path.getsize(config["source_file"])
-        with open("repack.cfg", "a") as f:
-            if not file_exists:
-                print("Created packertool.cfg")
-                f.write("# DO NOT EDIT\n")
-            print(f"Wrote \"filesize: {filesize}, fileend\" to repack.cfg")
-            f.write(f"filesize: {filesize}, fileend\n")
+        writeFile("repack.cfg", f"filesize: {filesize}, fileend\n", "# DO NOT EDIT\n")
     
 def repack():
     try:
@@ -265,24 +388,27 @@ def repack():
     
     for section, data in repack.items():
         print(section, data)
+        
+        #format is now "name:offset, type, location, flags"
+        # aka section:data[0], data[1], data[2], data[3]
+        
         if data[1] == "data": # data type, can be data, squashfs, jffs2, etc
-            write_sector(data[2], config["out_file"], int(data[0], 16)) # data[2] is file location, data[0] is offset
+            write_sector(data[2], config["out_file"], int(data[0], 16))
             print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
             
         elif data[1] == "squashfs":
             squashfs_location = os.path.join(config["repack_fs"], f"{section}.squashfs")
             
-            print(f"mksquashfs {data[3]} {squashfs_location} {data[2]} -noappend")
-            
-            args = ["mksquashfs", data[3], squashfs_location]
-            args += data[2].split()
-            args += ["-noappend"]
-
-            subprocess.run(args, check=True)
+            #mksquashfs input_dir output_file args --noappend
+            runCmd(["mksquashfs", data[2], squashfs_location, *data[3].split(), "-noappend"], True)
             
             write_sector(squashfs_location, config["out_file"], int(data[0], 16))
             print(f"Wrote {section} from {squashfs_location} starting at {data[0]} to {config["out_file"]}")
             
+        elif data[1] == "jffs2":
+            print("jffs2 is not supported, it will be treated as data")
+            write_sector(data[2], config["out_file"], int(data[0], 16))
+            print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
         else:
             print(f"Unknown type {data[1]}, ignoring")
     
