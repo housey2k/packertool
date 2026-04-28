@@ -2,32 +2,35 @@
 
 set -e
 
-OUT="./test_fw"
-mkdir -p "$OUT"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+FW="./firmware.bin"
+rm -f "$FW"
 
 # -----------------------
 # SquashFS
 # -----------------------
-mkdir -p "$OUT/sqroot"
-echo "squashfs test" > "$OUT/sqroot/hello.txt"
+mkdir -p "$TMP/sqroot"
+echo "squashfs test" > "$TMP/sqroot/hello.txt"
 
-mksquashfs "$OUT/sqroot" "$OUT/rootfs.squashfs" -noappend -comp xz
+mksquashfs "$TMP/sqroot" "$TMP/rootfs.squashfs" -noappend -comp xz
 
 # -----------------------
 # JFFS2
 # -----------------------
-mkdir -p "$OUT/jffs2root"
-echo "jffs2 config" > "$OUT/jffs2root/config.txt"
+mkdir -p "$TMP/jffs2root"
+echo "jffs2 config" > "$TMP/jffs2root/config.txt"
 
 mkfs.jffs2 \
-    -r "$OUT/jffs2root" \
-    -o "$OUT/config.jffs2" \
+    -r "$TMP/jffs2root" \
+    -o "$TMP/config.jffs2" \
     -e 0x10000
 
 # -----------------------
 # uImage
 # -----------------------
-echo "TEST_KERNEL_DATA" > "$OUT/kernel.bin"
+echo "TEST_KERNEL_DATA" > "$TMP/kernel.bin"
 
 mkimage \
     -A mips \
@@ -37,15 +40,12 @@ mkimage \
     -a 0x80010000 \
     -e 0x80010000 \
     -n "test-kernel" \
-    -d "$OUT/kernel.bin" \
-    "$OUT/uImage.bin"
+    -d "$TMP/kernel.bin" \
+    "$TMP/uImage.bin"
 
 # -----------------------
 # Build fake firmware layout
 # -----------------------
-FW="$OUT/firmware.bin"
-rm -f "$FW"
-
 append() {
     cat "$1" >> "$FW"
 }
@@ -56,29 +56,37 @@ align() {
     dd if=/dev/zero bs=1 count=$PAD >> "$FW" 2>/dev/null
 }
 
-START_SQ=0x0
-append "$OUT/rootfs.squashfs"
+# SquashFS
+START_SQ=0
+append "$TMP/rootfs.squashfs"
 align
 END_SQ=$(stat -c%s "$FW")
 
+# JFFS2
 START_JFFS=$END_SQ
-append "$OUT/config.jffs2"
+append "$TMP/config.jffs2"
 align
 END_JFFS=$(stat -c%s "$FW")
 
+# uImage
 START_UIMG=$END_JFFS
-append "$OUT/uImage.bin"
+append "$TMP/uImage.bin"
 align
 END_UIMG=$(stat -c%s "$FW")
 
 # -----------------------
-# mtdparts output
+# mtdparts output (offset, size)
 # -----------------------
+SIZE_SQ=$((END_SQ - START_SQ))
+SIZE_JFFS=$((END_JFFS - START_JFFS))
+SIZE_UIMG=$((END_UIMG - START_UIMG))
+
 echo ""
-echo "mtdparts=custom:"
-echo "0x$START_SQ,0x$END_SQ,squashfs"
-echo "0x$START_JFFS,0x$END_JFFS,jffs2"
-echo "0x$START_UIMG,0x$END_UIMG,uImage"
+echo "mtdparts="
+
+printf "0x%x,0x%x,squashfs\n" "$START_SQ" "$END_SQ"
+printf "0x%x,0x%x,jffs2\n" "$START_JFFS" "$END_JFFS"
+printf "0x%x,0x%x,uImage\n" "$START_UIMG" "$END_UIMG"
 
 echo ""
 echo "Firmware: $FW"

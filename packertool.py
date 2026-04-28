@@ -147,7 +147,7 @@ def get_uimage_repack_flags(path):
         raise ValueError("Not a uImage")
 
     arch_map = {
-        8: "mips",
+        5: "mips",
         2: "arm",
         3: "x86",
     }
@@ -185,7 +185,16 @@ def get_uimage_repack_flags(path):
     flags.append(f"-e 0x{entry:x}")
 
     if name:
-        flags.append(f"-n \"{name}\"")
+        flags.append(f"-n {name}")
+        
+    if False: #debug, change to false
+        print("START DEBUG")
+        
+        print(f"get_uimage_repack_flags({path}): {" ".join(flags)}")
+        print("RAW ARCH BYTE:", arch)
+        print("MAPPED ARCH:", arch_str)
+        
+        print("END DEBUG")
 
     return " ".join(flags)
     
@@ -271,6 +280,7 @@ def unpack():
             end = int(end, 0)
             
             print(f"Extracting {name} from {start} to {end}")
+            print(f"start={start}, end={end}, size={end-start}")
             
             binFilePath = os.path.join(config["unpack_raw"], f"{name}.bin") #binary file extracted
             
@@ -336,9 +346,8 @@ def unpack():
                 writeFile("repack.cfg", f"{name}: {hex(start)}, jffs2, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
                 
             elif "u-boot legacy uImage" in fileMagic:
-                print("u-boot legacy uImage WIP")
                 
-                uImgFilePath = os.path.join(config["unpack_raw"], f"{name}.uimg") # raw jffs2 file
+                uImgFilePath = os.path.join(config["unpack_raw"], f"{name}.uimg") # raw uImage file
                 extImgPath = os.path.join(config["unpack_raw"], f"{name}.bin") # extracted uImage file
                 
                 print(f"Renaming {binFilePath} into {uImgFilePath}")
@@ -387,18 +396,25 @@ def repack():
     os.makedirs(config["repack_fs"], exist_ok=True)
     
     for section, data in repack.items():
-        print(section, data)
+        #print(section, data)
         
         #format is now "name:offset, type, location, flags"
         # aka section:data[0], data[1], data[2], data[3]
         
         if data[1] == "data": # data type, can be data, squashfs, jffs2, etc
-            write_sector(data[2], config["out_file"], int(data[0], 16))
-            print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
+            data_location = os.path.join(config["repack_fs"], f"{section}.bin")
+            
+            print(f"Copying {section} from {data[2]} to {data_location}")
+            
+            shutil.copy(data[2], data_location)
+            
+            write_sector(data_location, config["out_file"], int(data[0], 16))
+            print(f"Wrote {section} from {data_location} starting at {data[0]} to {config["out_file"]}")
             
         elif data[1] == "squashfs":
             squashfs_location = os.path.join(config["repack_fs"], f"{section}.squashfs")
             
+            print(f"Compressing squashfs {section}")
             #mksquashfs input_dir output_file args --noappend
             runCmd(["mksquashfs", data[2], squashfs_location, *data[3].split(), "-noappend"], True)
             
@@ -407,8 +423,30 @@ def repack():
             
         elif data[1] == "jffs2":
             print("jffs2 is not supported, it will be treated as data")
-            write_sector(data[2], config["out_file"], int(data[0], 16))
+            
+            data_location = os.path.join(config["repack_fs"], f"{section}.bin")
+            
+            print(f"Copying {section} from {data[2]} to {data_location}")
+            
+            shutil.copy(data[2], data_location)
+            
+            write_sector(data_location, config["out_file"], int(data[0], 16))
+            print(f"Wrote {section} from {data_location} starting at {data[0]} to {config["out_file"]}")
+            
+        elif data[1] == "uimg":
+
+            uimg_location = os.path.join(config["repack_fs"], f"{section}.uimg")
+            
+            print(f"Compressing uImage {section}")
+            
+            #mkimage flags -d input_file output_file
+            runCmd(["mkimage", *data[3].split(), "-d", data[2], uimg_location], True)
+            
+            # in file, out file, offset
+            write_sector(uimg_location, config["out_file"], int(data[0], 16))
             print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
+        elif data[1] == "fileend":
+            print(f"Reached EOF at {data[0]}")
         else:
             print(f"Unknown type {data[1]}, ignoring")
     
@@ -470,7 +508,7 @@ def clean():
 # ----------------- Example -----------------
 if __name__ == "__main__":
     
-    print("packertool v0.0.2")
+    print("packertool v0.0.3")
     print("Written with <3 by housey2k")
     print("Version 1.0.1")
     print("Know your firmware!")
