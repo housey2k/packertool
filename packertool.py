@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import re
 import sys
 import os
@@ -5,6 +6,11 @@ import subprocess
 import magic
 import shutil
 import struct
+import gzip
+import lzma
+import bz2
+import time
+import zlib
 
 from pprint import pprint
 
@@ -127,102 +133,154 @@ def get_squashfs_repack_flags(path):
         flags.append(f"-b {block_size}")
 
     return " ".join(flags)
-    
-def get_uimage_repack_flags(path):
-    with open(path, "rb") as f:
-        data = f.read(64)
 
+
+
+def get_uimage_repack_flags(uimage_path):
+    UIMAGE_MAGIC = 0x27051956
+
+    data = open(uimage_path, "rb").read(64)
     if len(data) < 64:
-        raise ValueError("Not a valid uImage (too small)")
+        raise ValueError("Not a valid uImage")
 
-    magic, hcrc, time, size, load, entry, dcrc, os, arch, img_type, comp = struct.unpack(
-        ">IIIIIIIBBBB",
-        data[:32]
-    )
+    magic = struct.unpack(">I", data[0:4])[0]
+    if magic != UIMAGE_MAGIC:
+        raise ValueError("Not a uImage")
+
+    size      = struct.unpack(">I", data[12:16])[0]
+    load_addr = struct.unpack(">I", data[16:20])[0]
+    entry     = struct.unpack(">I", data[20:24])[0]
+
+    os_id   = data[28]
+    arch_id = data[29]
+    type_id = data[30]
+    comp_id = data[31]
 
     name = data[32:64].split(b"\x00", 1)[0].decode(errors="ignore")
 
-    # sanity check
-    if magic != 0x27051956:
-        raise ValueError("Not a uImage")
+    OS = {5: "linux"}
+    ARCH = {2: "arm", 3: "x86", 8: "mips"}
+    TYPE = {2: "kernel", 4: "multi", 5: "firmware", 7: "filesystem"}
+    COMP = {0: "none", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo", 5: "lz4", 6: "zstd"}
 
-    arch_map = {
-        5: "mips",
-        2: "arm",
-        3: "x86",
-    }
-
-    os_map = {
-        5: "linux",
-    }
-
-    comp_map = {
-        2: "gzip",
-        3: "bzip2",
-        4: "lzma",
-        5: "lz4",
-    }
-
-    type_map = {
-        2: "kernel",
-        3: "ramdisk",
-        7: "firmware",
-    }
-
-    arch_str = arch_map.get(arch, "unknown")
-    os_str = os_map.get(os, "linux")
-    comp_str = comp_map.get(comp, "none")
-    type_str = type_map.get(img_type, "firmware")
-
-    # build CLI flags (same style as your squashfs function)
-    flags = []
-
-    flags.append(f"-A {arch_str}")
-    flags.append(f"-O {os_str}")
-    flags.append(f"-T {type_str}")
-    flags.append(f"-C {comp_str}")
-    flags.append(f"-a 0x{load:x}")
-    flags.append(f"-e 0x{entry:x}")
+    flags = [
+        f"-A {ARCH.get(arch_id, f'unknown:{arch_id}')}",
+        f"-O {OS.get(os_id, f'unknown:{os_id}')}",
+        f"-T {TYPE.get(type_id, f'unknown:{type_id}')}",
+        f"-C {COMP.get(comp_id, f'unknown:{comp_id}')}",
+        f"-a 0x{load_addr:08x}",
+        f"-e 0x{entry:08x}",
+    ]
 
     if name:
-        flags.append(f"-n {name}")
-        
-    if False: #debug, change to false
-        print("START DEBUG")
-        
-        print(f"get_uimage_repack_flags({path}): {" ".join(flags)}")
-        print("RAW ARCH BYTE:", arch)
-        print("MAPPED ARCH:", arch_str)
-        
-        print("END DEBUG")
+        flags.append(f'-n "{name}"')
 
     return " ".join(flags)
     
+import subprocess
+
+def extract_uimage(uimage_path, out_path):
+    print("[+] inspecting image")
+
+    subprocess.run(
+        ["dumpimage", "-l", uimage_path],
+        capture_output=True,
+        text=True
+    )
+
+    print("[+] extracting payload")
+
+    result = subprocess.run(
+        ["dumpimage", "-o", "-", uimage_path],
+        capture_output=True
+    )
+
+    # success case
+    if result.returncode == 0 and result.stdout:
+        with open(out_path, "wb") as f:
+            f.write(result.stdout)
+
+        print("[+] extraction successful")
+        return True
+
+    # failure case (no writes, no side effects)
+    print("[!] extraction failed")
+    return False
     
-def extract_uimage(path, out_path):
-    import struct, lzma, gzip
+def make_uimage(flags, payload_path, out_path):
+    UIMAGE_MAGIC = 0x27051956
 
-    data = open(path, "rb").read()
+    # --- parse flags ---
+    import re
 
-    magic = struct.unpack(">I", data[0:4])[0]
-    if magic != 0x27051956:
-        raise ValueError("Not uImage")
+    def grab(flag):
+        m = re.search(rf"{flag}\s+([^\s]+)", flags)
+        return m.group(1) if m else None
 
-    size = struct.unpack(">I", data[12:16])[0]
-    comp = data[40]  # compression field in header
+    def grab_hex(flag):
+        m = re.search(rf"{flag}\s+0x([0-9a-fA-F]+)", flags)
+        return int(m.group(1), 16) if m else 0
 
-    payload = data[64:64+size]
+    def grab_name():
+        m = re.search(r'-n\s+"(.*?)"', flags)
+        return m.group(1) if m else ""
 
-    # YOU handle payload here
-    if comp == 4:  # LZMA
-        payload = lzma.decompress(payload)
-    elif comp == 2:  # gzip
-        payload = gzip.decompress(payload)
+    arch_s = grab("-A")
+    os_s   = grab("-O")
+    type_s = grab("-T")
+    comp_s = grab("-C")
 
+    load  = grab_hex("-a")
+    entry = grab_hex("-e")
+    name  = grab_name()
+
+    # --- tables ---
+    OS   = {"linux": 5}
+    ARCH = {"arm": 2, "x86": 3, "mips": 8}
+    TYPE = {"kernel": 2, "multi": 4, "firmware": 5, "filesystem": 7}
+    COMP = {"none": 0, "gzip": 1, "bzip2": 2, "lzma": 3, "lzo": 4, "lz4": 5, "zstd": 6}
+
+    arch_id = ARCH.get(arch_s, 0)
+    os_id   = OS.get(os_s, 0)
+    type_id = TYPE.get(type_s, 0)
+    comp_id = COMP.get(comp_s, 0)
+
+    payload = open(payload_path, "rb").read()
+    size = len(payload)
+
+    name_bytes = name.encode()[:32].ljust(32, b"\x00")
+
+    # --- header (temporary CRCs) ---
+    header = struct.pack(
+        ">IIIIIIIBBBB32s",
+        UIMAGE_MAGIC,
+        0,
+        int(time.time()),
+        size,
+        load,
+        entry,
+        0,
+        os_id,
+        arch_id,
+        type_id,
+        comp_id,
+        name_bytes
+    )
+
+    # --- CRCs ---
+    dcrc = zlib.crc32(payload) & 0xFFFFFFFF
+    header = header[:24] + struct.pack(">I", dcrc) + header[28:]
+
+    hcrc = zlib.crc32(header) & 0xFFFFFFFF
+    header = header[:4] + struct.pack(">I", hcrc) + header[8:]
+
+    # --- write final image ---
     with open(out_path, "wb") as f:
+        f.write(header)
         f.write(payload)
 
-    return payload
+    print(f"[+] wrote uImage -> {out_path}")
+
     
 def write_sector(in_file, out_file, offset):
     with open(in_file, "rb") as f_in, open(out_file, "r+b") as f_out:
@@ -354,19 +412,21 @@ def unpack():
                 
                 os.rename(binFilePath, uImgFilePath)
                 
-                print(f"Extracting uImage into {extImgPath}")
-               
-                extract_uimage(uImgFilePath, extImgPath)
+                print(f"Reading uImage")
                 
                 uImg_flags = get_uimage_repack_flags(uImgFilePath)
-
-                print(f"uImage flags: {uImg_flags}")
-
-                writeFile("repack.cfg", f"{name}: {hex(start)}, uimg, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
                 
-                print(f"Deleting {uImgFilePath}")
-                os.remove(uImgFilePath)
+                print(f"Unpacking uImage payload into {extImgPath}")
                 
+                uimage_extract_sucess = extract_uimage(uImgFilePath, extImgPath)
+                
+                if (!uimage_extract_sucess):
+                    print("uImage extraction failed, saving as data + flags")
+                    writeFile("repack.cfg", f"{name}: {hex(start)}, data, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
+                elif:
+                    writeFile("repack.cfg", f"{name}: {hex(start)}, uimg, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
+                    print(f"Deleting {uImgFilePath}")
+                    os.remove(uImgFilePath)
             else:
                 writeFile("repack.cfg", f"{name}: {hex(start)}, data, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
         
@@ -434,17 +494,13 @@ def repack():
             print(f"Wrote {section} from {data_location} starting at {data[0]} to {config["out_file"]}")
             
         elif data[1] == "uimg":
-
-            uimg_location = os.path.join(config["repack_fs"], f"{section}.uimg")
+            uimg_out_location = os.path.join(config["repack_fs"], f"{section}.uimg")
             
-            print(f"Compressing uImage {section}")
+            #make_uimage(flags, payload_location, out_location)
+            make_uimage(data[3], data[2], uimg_out_location)
             
-            #mkimage flags -d input_file output_file
-            runCmd(["mkimage", *data[3].split(), "-d", data[2], uimg_location], True)
-            
-            # in file, out file, offset
-            write_sector(uimg_location, config["out_file"], int(data[0], 16))
-            print(f"Wrote {section} from {data[2]} starting at {data[0]} to {config["out_file"]}")
+            write_sector(uimg_out_location, config["out_file"], int(data[0], 16))
+            print(f"Wrote {section} from {uimage_out_location} starting at {data[0]} to {config["out_file"]}")
         elif data[1] == "fileend":
             print(f"Reached EOF at {data[0]}")
         else:
@@ -508,7 +564,7 @@ def clean():
 # ----------------- Example -----------------
 if __name__ == "__main__":
     
-    print("packertool v0.0.3")
+    print("packertool v0.0.4")
     print("Written with <3 by housey2k")
     print("Version 1.0.1")
     print("Know your firmware!")
@@ -541,6 +597,9 @@ if __name__ == "__main__":
         
     elif sys.argv[1] == "clean":
         clean()
+    elif sys.argv[1] == "unpack-safe":
+        print("Not implemented")
+        #unpack_safe()
         
     else:
         print(f"Unknown command: {sys.argv[1]}")

@@ -1,0 +1,8 @@
+/repack_fs/
+/unpack_fs/
+/unpack_raw/
+/packertool/
+
+/repack.cfg
+/packertool.cfg
+/firmware-repack.bin
