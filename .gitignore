@@ -2,6 +2,7 @@
 /unpack_fs/
 /unpack_raw/
 /packertool/
+/modules/__pycache__
 
 /repack.cfg
 /packertool.cfg

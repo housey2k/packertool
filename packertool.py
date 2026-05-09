@@ -16,6 +16,12 @@ from pprint import pprint
 
 from typing import Any, Dict
 
+import modules.uimage
+import modules.jffs2
+import modules.squashfs
+import modules.config_parser
+import modules.os_utils
+
 cfg_sample = """
 source_file: firmware.bin # input file when unpack is used
 out_file: firmware-repack.bin # output file when repack is used
@@ -40,266 +46,10 @@ logo: 0xf60000, squashfs, -comp xz -b 4096, unpack_fs/logo
 mtd: 0xf80000, data, unpack_fs/mtd
 
 """
-def parse_firmware_config(text: str) -> Dict[str, Any]:
-    """
-    Parses a firmware config format like:
-    key: value # comment
-    """
-
-    config = {}
-
-    # matches: key : value # comment (comment optional)
-    line_re = re.compile(r"""
-        ^\s*
-        (?P<key>[a-zA-Z0-9_]+)
-        \s*:\s*
-        (?P<value>[^#\n]+?)
-        \s*
-        (?:\#.*)?$
-    """, re.VERBOSE)
-
-    for line in text.splitlines():
-        line = line.strip()
-
-        # skip empty lines
-        if not line:
-            continue
-
-        match = line_re.match(line)
-        if not match:
-            continue  # or raise error if you want strict parsing
-
-        key = match.group("key").strip()
-        value = match.group("value").strip()
-
-        config[key] = _normalize_value(value)
-
-    return config
-
-
-def _normalize_value(value: str) -> Any:
-    """
-    Try to convert values into useful Python types.
-    """
-
-    # boolean-like
-    if value.lower() in ("true", "false"):
-        return value.lower() == "true"
-
-    # integer (hex or decimal)
-    if re.fullmatch(r"0x[0-9a-fA-F]+", value):
-        return int(value, 16)
-
-    if re.fullmatch(r"-?\d+", value):
-        return int(value)
-
-    # list-like (comma-separated or space-separated? here we assume comma)
-    if "," in value:
-        return [v.strip() for v in value.split(",")]
-
-    return value
-   
-
-def get_squashfs_repack_flags(path):
-    result = subprocess.run(
-        ["unsquashfs", "-s", path],
-        capture_output=True,
-        text=True,
-        check=True
-    )
-
-    out = result.stdout
-
-    comp = None
-    block_size = None
-
-    # compression
-    m = re.search(r"Compression\s+(\w+)", out, re.IGNORECASE)
-    if m:
-        comp = m.group(1)
-
-    # block size
-    m = re.search(r"Block size\s+(\d+)", out, re.IGNORECASE)
-    if m:
-        block_size = m.group(1)
-
-    # build CLI flags
-    flags = []
-
-    if comp:
-        flags.append(f"-comp {comp}")
-
-    if block_size:
-        flags.append(f"-b {block_size}")
-
-    return " ".join(flags)
-
-
-
-def get_uimage_repack_flags(uimage_path):
-    UIMAGE_MAGIC = 0x27051956
-
-    data = open(uimage_path, "rb").read(64)
-    if len(data) < 64:
-        raise ValueError("Not a valid uImage")
-
-    magic = struct.unpack(">I", data[0:4])[0]
-    if magic != UIMAGE_MAGIC:
-        raise ValueError("Not a uImage")
-
-    size      = struct.unpack(">I", data[12:16])[0]
-    load_addr = struct.unpack(">I", data[16:20])[0]
-    entry     = struct.unpack(">I", data[20:24])[0]
-
-    os_id   = data[28]
-    arch_id = data[29]
-    type_id = data[30]
-    comp_id = data[31]
-
-    name = data[32:64].split(b"\x00", 1)[0].decode(errors="ignore")
-
-    OS = {5: "linux"}
-    ARCH = {2: "arm", 3: "x86", 8: "mips"}
-    TYPE = {2: "kernel", 4: "multi", 5: "firmware", 7: "filesystem"}
-    COMP = {0: "none", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo", 5: "lz4", 6: "zstd"}
-
-    flags = [
-        f"-A {ARCH.get(arch_id, f'unknown:{arch_id}')}",
-        f"-O {OS.get(os_id, f'unknown:{os_id}')}",
-        f"-T {TYPE.get(type_id, f'unknown:{type_id}')}",
-        f"-C {COMP.get(comp_id, f'unknown:{comp_id}')}",
-        f"-a 0x{load_addr:08x}",
-        f"-e 0x{entry:08x}",
-    ]
-
-    if name:
-        flags.append(f'-n "{name}"')
-
-    return " ".join(flags)
-    
-import subprocess
-
-def extract_uimage(uimage_path, out_path):
-    print("[+] inspecting image")
-
-    subprocess.run(
-        ["dumpimage", "-l", uimage_path],
-        capture_output=True,
-        text=True
-    )
-
-    print("[+] extracting payload")
-
-    result = subprocess.run(
-        ["dumpimage", "-o", "-", uimage_path],
-        capture_output=True
-    )
-
-    # success case
-    if result.returncode == 0 and result.stdout:
-        with open(out_path, "wb") as f:
-            f.write(result.stdout)
-
-        print("[+] extraction successful")
-        return True
-
-    # failure case (no writes, no side effects)
-    print("[!] extraction failed")
-    return False
-    
-def make_uimage(flags, payload_path, out_path):
-    UIMAGE_MAGIC = 0x27051956
-
-    # --- parse flags ---
-    import re
-
-    def grab(flag):
-        m = re.search(rf"{flag}\s+([^\s]+)", flags)
-        return m.group(1) if m else None
-
-    def grab_hex(flag):
-        m = re.search(rf"{flag}\s+0x([0-9a-fA-F]+)", flags)
-        return int(m.group(1), 16) if m else 0
-
-    def grab_name():
-        m = re.search(r'-n\s+"(.*?)"', flags)
-        return m.group(1) if m else ""
-
-    arch_s = grab("-A")
-    os_s   = grab("-O")
-    type_s = grab("-T")
-    comp_s = grab("-C")
-
-    load  = grab_hex("-a")
-    entry = grab_hex("-e")
-    name  = grab_name()
-
-    # --- tables ---
-    OS   = {"linux": 5}
-    ARCH = {"arm": 2, "x86": 3, "mips": 8}
-    TYPE = {"kernel": 2, "multi": 4, "firmware": 5, "filesystem": 7}
-    COMP = {"none": 0, "gzip": 1, "bzip2": 2, "lzma": 3, "lzo": 4, "lz4": 5, "zstd": 6}
-
-    arch_id = ARCH.get(arch_s, 0)
-    os_id   = OS.get(os_s, 0)
-    type_id = TYPE.get(type_s, 0)
-    comp_id = COMP.get(comp_s, 0)
-
-    payload = open(payload_path, "rb").read()
-    size = len(payload)
-
-    name_bytes = name.encode()[:32].ljust(32, b"\x00")
-
-    # --- header (temporary CRCs) ---
-    header = struct.pack(
-        ">IIIIIIIBBBB32s",
-        UIMAGE_MAGIC,
-        0,
-        int(time.time()),
-        size,
-        load,
-        entry,
-        0,
-        os_id,
-        arch_id,
-        type_id,
-        comp_id,
-        name_bytes
-    )
-
-    # --- CRCs ---
-    dcrc = zlib.crc32(payload) & 0xFFFFFFFF
-    header = header[:24] + struct.pack(">I", dcrc) + header[28:]
-
-    hcrc = zlib.crc32(header) & 0xFFFFFFFF
-    header = header[:4] + struct.pack(">I", hcrc) + header[8:]
-
-    # --- write final image ---
-    with open(out_path, "wb") as f:
-        f.write(header)
-        f.write(payload)
-
-    print(f"[+] wrote uImage -> {out_path}")
 
     
-def write_sector(in_file, out_file, offset):
-    with open(in_file, "rb") as f_in, open(out_file, "r+b") as f_out:
-        data = f_in.read()
-        f_out.seek(offset)
-        f_out.write(data)
-       
-def writeFile(out_file, text, header = ""):
-    file_exists = os.path.exists(out_file)    
-    with open(out_file, "a") as f:
-        if not file_exists:
-            f.write(header)
-            print(f"Created {out_file} and wrote {header}")
-        f.write(text)
-        print(f"Wrote {text} to {out_file}")  
-def runCmd(args, check=True):
-    print(f"Running command {args}")
-    subprocess.run(args, check=check)
-    print(f"Finished command")
+
+
     
 def displayArgs():
     print("help           Show help")
@@ -310,12 +60,7 @@ def displayArgs():
     print("makecfg        Write example cfg file")
     
 def unpack():
-    try:
-        with open('packertool.cfg', 'r') as file:
-            config = parse_firmware_config(file.read())
-    except FileNotFoundError:
-        print("File not found, please call makecfg")
-        sys.exit(1)
+    config = modules.config_parser.readcfg("packertool.cfg")
     
     os.makedirs(config["unpack_raw"], exist_ok=True)
     os.makedirs(config["unpack_fs"], exist_ok=True)
@@ -372,81 +117,21 @@ def unpack():
             
             # TODO: Move file operations into /tmp to spare HDD/SSD cycles
             
-            if "Squashfs filesystem" in fileMagic:
-                
-                squashfsFilePath = os.path.join(config["unpack_raw"], f"{name}.squashfs") # raw squashfs file
-                squashfsFolder = os.path.join(config["unpack_fs"], name) # folder for extracted squashfs
-                
-                print(f"Renaming {binFilePath} into {squashfsFilePath}")
-
-                os.rename(binFilePath, squashfsFilePath) # rename from .bin into .squashfs
-                
-                print(f"Extracting squashfs partition into {squashfsFolder}")
-                
-                runCmd(["unsquashfs", "-d", squashfsFolder, squashfsFilePath], True)
-                
-                squashfs_flags = get_squashfs_repack_flags(squashfsFilePath) # flags being compression alg -comp and block size -b
-
-                print(f"SquashFS flags: {squashfs_flags}")
-                    
-                writeFile("repack.cfg", f"{name}: {hex(start)}, squashfs, {squashfsFolder}, {squashfs_flags}\n", "# DO NOT EDIT\n")
-                
-                print(f"Deleting {squashfsFilePath}")
-                os.remove(squashfsFilePath)
-                
+            if "Squashfs filesystem" in fileMagic:  
+                modules.squashfs.unpack(start, name, config, binFilePath)
             elif "jffs2 filesystem" in fileMagic:
-                print("jffs2 is not supported, it will be treated as data")
-
-                jffs2FilePath = os.path.join(config["unpack_raw"], f"{name}.jffs2") # raw jffs2 file
-                
-                print(f"Renaming {binFilePath} into {jffs2FilePath}")
-                
-                writeFile("repack.cfg", f"{name}: {hex(start)}, jffs2, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
-                
+                modules.jffs2.unpack(start, name, config, binFilePath)
             elif "u-boot legacy uImage" in fileMagic:
-                
-                uImgFilePath = os.path.join(config["unpack_raw"], f"{name}.uimg") # raw uImage file
-                extImgPath = os.path.join(config["unpack_raw"], f"{name}.bin") # extracted uImage file
-                
-                print(f"Renaming {binFilePath} into {uImgFilePath}")
-                
-                os.rename(binFilePath, uImgFilePath)
-                
-                print(f"Reading uImage")
-                
-                uImg_flags = get_uimage_repack_flags(uImgFilePath)
-                
-                print(f"Unpacking uImage payload into {extImgPath}")
-                
-                uimage_extract_sucess = extract_uimage(uImgFilePath, extImgPath)
-                
-                if (!uimage_extract_sucess):
-                    print("uImage extraction failed, saving as data + flags")
-                    writeFile("repack.cfg", f"{name}: {hex(start)}, data, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
-                elif:
-                    writeFile("repack.cfg", f"{name}: {hex(start)}, uimg, {extImgPath}, {uImg_flags} \n", "# DO NOT EDIT\n")
-                    print(f"Deleting {uImgFilePath}")
-                    os.remove(uImgFilePath)
+                modules.uimage.unpack(start, name, config, binFilePath)
             else:
-                writeFile("repack.cfg", f"{name}: {hex(start)}, data, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
+                modules.os_utils.writeFile("repack.cfg", f"{name}: {hex(start)}, data, {binFilePath}, noflags \n", "# DO NOT EDIT\n")
         
         filesize = os.path.getsize(config["source_file"])
-        writeFile("repack.cfg", f"filesize: {filesize}, fileend\n", "# DO NOT EDIT\n")
+        modules.os_utils.writeFile("repack.cfg", f"filesize: {filesize}, fileend\n", "# DO NOT EDIT\n")
     
 def repack():
-    try:
-        with open('repack.cfg', 'r') as file:
-            repack = parse_firmware_config(file.read())
-    except FileNotFoundError:
-        print("File not found, please call unpack")
-        sys.exit(1)
-        
-    try:
-        with open('packertool.cfg', 'r') as file:
-            config = parse_firmware_config(file.read())
-    except FileNotFoundError:
-        print("File not found, please call makecfg")
-        sys.exit(1)
+    repack = modules.config_parser.readcfg("repack.cfg")
+    config = modules.config_parser.readcfg("packertool.cfg")
 
     with open(config["out_file"], "wb") as f:
         f.seek(int(repack["filesize"][0]) - 1)
@@ -461,46 +146,22 @@ def repack():
         #format is now "name:offset, type, location, flags"
         # aka section:data[0], data[1], data[2], data[3]
         
-        if data[1] == "data": # data type, can be data, squashfs, jffs2, etc
+        if data[1] == "data": # data[1] eq data type, can be data, squashfs, jffs2, etc
             data_location = os.path.join(config["repack_fs"], f"{section}.bin")
             
             print(f"Copying {section} from {data[2]} to {data_location}")
             
             shutil.copy(data[2], data_location)
             
-            write_sector(data_location, config["out_file"], int(data[0], 16))
+            modules.os_utils.write_sector(data_location, config["out_file"], int(data[0], 16))
             print(f"Wrote {section} from {data_location} starting at {data[0]} to {config["out_file"]}")
             
         elif data[1] == "squashfs":
-            squashfs_location = os.path.join(config["repack_fs"], f"{section}.squashfs")
-            
-            print(f"Compressing squashfs {section}")
-            #mksquashfs input_dir output_file args --noappend
-            runCmd(["mksquashfs", data[2], squashfs_location, *data[3].split(), "-noappend"], True)
-            
-            write_sector(squashfs_location, config["out_file"], int(data[0], 16))
-            print(f"Wrote {section} from {squashfs_location} starting at {data[0]} to {config["out_file"]}")
-            
+            modules.squashfs.repack(section, data, config)
         elif data[1] == "jffs2":
-            print("jffs2 is not supported, it will be treated as data")
-            
-            data_location = os.path.join(config["repack_fs"], f"{section}.bin")
-            
-            print(f"Copying {section} from {data[2]} to {data_location}")
-            
-            shutil.copy(data[2], data_location)
-            
-            write_sector(data_location, config["out_file"], int(data[0], 16))
-            print(f"Wrote {section} from {data_location} starting at {data[0]} to {config["out_file"]}")
-            
+            modules.jffs2.repack(section, data, config)
         elif data[1] == "uimg":
-            uimg_out_location = os.path.join(config["repack_fs"], f"{section}.uimg")
-            
-            #make_uimage(flags, payload_location, out_location)
-            make_uimage(data[3], data[2], uimg_out_location)
-            
-            write_sector(uimg_out_location, config["out_file"], int(data[0], 16))
-            print(f"Wrote {section} from {uimage_out_location} starting at {data[0]} to {config["out_file"]}")
+            modules.uimage.repack(section, data, config)
         elif data[1] == "fileend":
             print(f"Reached EOF at {data[0]}")
         else:
@@ -512,30 +173,12 @@ def configurator():
     print("Not implemented, edit packertool.cfg")
     
 def dumpcfg(mode=None):
-
-    # 1. explicit repack mode
-    if mode == "repack":
-        content = repack_sample
-        print("Using repack_sample")
-
-    # 2. explicit packertool sample mode
-    elif mode == "packertool":
-        content = cfg_sample
-        print("Using cfg_sample")
-
-    # 3. default behavior: try file, fallback to sample
-    else:
-        try:
-            with open("packertool.cfg", "r") as f:
-                content = f.read()
-                print("Loaded packertool.cfg")
-        except FileNotFoundError:
-            content = cfg_sample
-            print("Config not found, using cfg_sample")
-
-    # 4. parse
     print("Parsed output:")
-    config = parse_firmware_config(content)
+    config = modules.config_parser.readcfg("packertool.cfg")
+    pprint(config)
+    
+    print("Parsed output:")
+    config = modules.config_parser.readcfg("packertool.cfg")
     pprint(config)
 
 
@@ -544,12 +187,7 @@ def makecfg():
         f.write(cfg_sample)
         
 def clean():
-    try:
-        with open('packertool.cfg', 'r') as file:
-            config = parse_firmware_config(file.read())
-    except FileNotFoundError:
-        print("File not found, please call makecfg")
-        sys.exit(1)
+    config = modules.config_parser.readcfg("packertool.cfg")
     
     for key in ["unpack_raw", "unpack_fs", "repack_fs"]:
         path = config[key]
@@ -564,9 +202,8 @@ def clean():
 # ----------------- Example -----------------
 if __name__ == "__main__":
     
-    print("packertool v0.0.4")
+    print("packertool v0.0.6")
     print("Written with <3 by housey2k")
-    print("Version 1.0.1")
     print("Know your firmware!")
     print("This program is in early development, please help by contributing with more functionality")
     
